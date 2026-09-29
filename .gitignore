@@ -1,0 +1,9 @@
+build/
+.xmake/
+*.dll
+*.exp
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exe
