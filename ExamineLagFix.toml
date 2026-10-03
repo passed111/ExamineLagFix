@@ -1,0 +1,18 @@
+# ExamineLagFix
+
+# Whether the entry filter also applies to the Pip-Boy inspect panel.
+#
+#   true  (default)  Inspecting an item in the Pip-Boy is fast, the same way the
+#                    pickup-examine panel is. Paging still works, but only
+#                    between variants of the same item: different mods of the
+#                    same weapon are separate entries sharing one handle id, so
+#                    they all survive the filter and W/S steps through them.
+#                    Unrelated items are not built, so a page cannot reach them.
+#
+#   false            The Pip-Boy inspect falls back to vanilla behaviour: the
+#                    whole inventory is built, so paging through every item
+#                    works again, but you pay the stall when the panel opens.
+#
+# The pickup-examine panel is always filtered. It has no paging button, so there
+# is nothing to trade off there.
+InspectFixInPipBoy = true
