@@ -227,6 +227,11 @@ namespace
     std::atomic<std::uintptr_t> g_callerRet[kCallerSlots];
     std::atomic<std::uint32_t>  g_callerN[kCallerSlots];
     std::atomic<std::uint32_t>  g_perEntryTries{ 0 };
+    // Set whenever the GetSelectedIndex override runs, i.e. the patch really is
+    // on the display path. Layer 1 is only allowed to shrink the list while this
+    // is proven - see the self-check in HookedUpdateItemList.
+    std::atomic<bool>           g_selIdxSeen{ false };
+    std::atomic<std::uint32_t>  g_selectiveTries{ 0 };
 
     // Timing breakdown of one rebuild, so the log can say whether the cost is
     // in the walk itself or somewhere around it.
@@ -855,6 +860,25 @@ namespace
         const bool selective =
             a_menu != nullptr && a_menu->inspectMode &&
             (!pipBoyInspect || g_fixInPipBoy != 0);
+        // Self-check. Layer 1 shrinks the SWF list, so the display index is only
+        // correct while GetSelectedIndex is actually being consulted. If the
+        // override has been installed through several filtered rebuilds and never
+        // once run, the patch is on the wrong function: keep filtering and the
+        // panel reads the clamped index, i.e. shows one fixed item (reported on OG
+        // as "the alphabetically lowest one"). Disable layer 1 in that case -
+        // layer 2 does not change the list length, so the display stays right.
+        if (g_origPerEntry != nullptr &&
+            !g_perEntryBroken.load(std::memory_order_acquire)) {
+            if (g_selIdxSeen.load(std::memory_order_acquire)) {
+                g_selectiveTries.store(0, std::memory_order_release);
+            } else if (g_selectiveTries.fetch_add(1, std::memory_order_relaxed) >= 2) {
+                g_perEntryBroken.store(true, std::memory_order_release);
+                REX::ERROR("ExamineLagFix: GetSelectedIndex override was never "
+                           "consulted across several filtered rebuilds - layer 1 "
+                           "disabled so the panel does not show a clamped entry");
+            }
+        }
+
         if (selective) {
             g_popTargetId = a_menu->modItem.id;
             g_popTargetStack = a_menu->modStack;
@@ -952,6 +976,14 @@ namespace
 
     std::int64_t HookedGetSelIdx(RE::ExamineMenu* a_menu)
     {
+        // Proof that this override really sits on the display path. Merely
+        // succeeding at patching something is not enough: a build with different
+        // bytes can put the patch on another function, and then the display keeps
+        // using the clamped index while layer 1 still shrinks the list - which
+        // shows one fixed (alphabetically first) item for every examine. The
+        // rebuild self-check below watches this flag.
+        g_selIdxSeen.store(true, std::memory_order_release);
+
         const auto own = g_targetIndex.load(std::memory_order_acquire);
         if (own >= 0 && a_menu == g_targetMenu) {
             return own;
@@ -1443,6 +1475,92 @@ namespace
         return IsInsideExe(tgt) ? tgt : 0;
     }
 
+    // Semantic cross-check for a GetSelectedIndex candidate: its body has to
+    // reference the literal "selectedIndex" (that is the SWF property it reads).
+    //
+    // The string alone does NOT identify the function - roughly 25 functions in
+    // every build reference it (TerminalMenu::GetSelectedIndex,
+    // GetCurrentSlotKeyword, the ModSlotList helpers ...). It is used only to
+    // confirm or reject what the signature matched, which is what protects
+    // against a build whose bytes differ (the GOG OG report: layer 1 filtering
+    // while the override never fired, so every examine showed the alphabetically
+    // first entry instead).
+    //
+    // Only the candidate's own body is scanned (~130 bytes), not all of .text.
+    [[nodiscard]] bool BodyReferencesSelIdxString(std::uintptr_t a_addr)
+    {
+        static constexpr char kStr[]{ "selectedIndex" };
+        constexpr std::size_t kLen = sizeof(kStr) - 1;
+
+        const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+        if (!base || a_addr < base) return false;
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+        std::uint32_t strRva[8];
+        std::size_t nStr = 0;
+        std::uintptr_t textVa = 0;
+        std::size_t textSize = 0;
+
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        bool ok = true;
+        __try {
+            for (std::uint32_t i = 0; i < nt->FileHeader.NumberOfSections && ok; ++i, ++sec) {
+                const auto sz = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+                if (sz == 0) continue;
+                const auto* b = reinterpret_cast<const std::uint8_t*>(base + sec->VirtualAddress);
+                if (std::memcmp(sec->Name, ".text", 5) == 0) {
+                    textVa = sec->VirtualAddress;
+                    textSize = sz;
+                }
+                if ((sec->Characteristics & IMAGE_SCN_MEM_WRITE) != 0) continue;
+                // memchr for the first byte, then compare - avoids a 13-byte
+                // memcmp at every position of a multi-MB section.
+                const auto* p = b;
+                const auto* endB = b + (sz >= kLen ? sz - kLen : 0);
+                while (p <= endB && nStr < 8) {
+                    p = reinterpret_cast<const std::uint8_t*>(
+                        std::memchr(p, kStr[0], static_cast<std::size_t>(endB - p) + 1));
+                    if (!p) break;
+                    if (std::memcmp(p, kStr, kLen) == 0) {
+                        strRva[nStr++] = static_cast<std::uint32_t>(sec->VirtualAddress + (p - b));
+                    }
+                    ++p;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+        if (nStr == 0 || textSize == 0) return false;
+
+        std::uintptr_t begin = 0;
+        std::size_t size = 0;
+        if (!PdataBounds(a_addr, &begin, &size) || size == 0 || size > 0x1000) return false;
+
+        bool found = false;
+        __try {
+            const auto* body = reinterpret_cast<const std::uint8_t*>(begin);
+            for (std::size_t i = 0; i + 7 <= size && !found; ++i) {
+                // REX.W/S/B/D  lea  reg,[rip+rel32]   (7 bytes)
+                if (body[i] < 0x40 || body[i] > 0x4F) continue;
+                if (body[i + 1] != 0x8D) continue;
+                const auto modrm = body[i + 2];
+                if ((modrm & 0xC7) != 0x05) continue;      // mod=00 rm=101
+                const auto rel = *reinterpret_cast<const std::int32_t*>(body + i + 3);
+                const auto tgt = static_cast<std::uint32_t>(
+                    textVa + (begin - base) + i + 7 + rel);
+                for (std::size_t s = 0; s < nStr; ++s) {
+                    if (tgt == strRva[s]) { found = true; break; }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+        return found;
+    }
+
     bool InstallGetSelIdxHook()
     {
         // ExamineMenu::GetSelectedIndex - reads the SWF "selectedIndex" off
@@ -1471,6 +1589,19 @@ namespace
 
         const auto addr = ScanTextSig(kPro, sizeof(kPro), nullptr, 0, true, "GetSelIdx");
         if (!addr) return false;
+
+        // Semantic confirmation. A build whose bytes differ can make the
+        // signature land on some other function that happens to share those 13
+        // bytes; patching that would leave the display path uncorrected while
+        // layer 1 still shrinks the list - which shows the wrong item for every
+        // examine. Requiring the body to read the "selectedIndex" property
+        // rejects that.
+        if (!BodyReferencesSelIdxString(addr)) {
+            REX::ERROR("ExamineLagFix: GetSelectedIndex signature hit 0x{:X} does not "
+                       "reference the \"selectedIndex\" property - wrong function, "
+                       "hook NOT installed", addr);
+            return false;
+        }
 
         // The 13 matched bytes are shorter than the 14-byte absolute jump, so
         // the displacement is decoded forward instead of being assumed. The
