@@ -860,24 +860,25 @@ namespace
         const bool selective =
             a_menu != nullptr && a_menu->inspectMode &&
             (!pipBoyInspect || g_fixInPipBoy != 0);
-        // Self-check. Layer 1 shrinks the SWF list, so the display index is only
-        // correct while GetSelectedIndex is actually being consulted. If the
-        // override has been installed through several filtered rebuilds and never
-        // once run, the patch is on the wrong function: keep filtering and the
-        // panel reads the clamped index, i.e. shows one fixed item (reported on OG
-        // as "the alphabetically lowest one"). Disable layer 1 in that case -
-        // layer 2 does not change the list length, so the display stays right.
-        if (g_origPerEntry != nullptr &&
-            !g_perEntryBroken.load(std::memory_order_acquire)) {
-            if (g_selIdxSeen.load(std::memory_order_acquire)) {
-                g_selectiveTries.store(0, std::memory_order_release);
-            } else if (g_selectiveTries.fetch_add(1, std::memory_order_relaxed) >= 2) {
-                g_perEntryBroken.store(true, std::memory_order_release);
-                REX::ERROR("ExamineLagFix: GetSelectedIndex override was never "
-                           "consulted across several filtered rebuilds - layer 1 "
-                           "disabled so the panel does not show a clamped entry");
-            }
-        }
+        // 防御二（运行时自检）—— 当前停用，整段注释保留备查。
+        // 作用：HookedGetSelIdx 被调用即置 g_selIdxSeen；若第一层已装但连续
+        // 几次 rebuild 都没被调用，说明覆盖不在显示路径上 → 自动禁用第一层
+        // （第二层不改变列表长度，显示仍正确）。
+        // 停用理由：13 字节签名已在 OG/NG/AE 四版实测唯一命中，此自检属冗余。
+        // 若要恢复：反注释本段，并反注释 HookedGetSelIdx 里
+        // g_selIdxSeen.store(true, ...) 那一行。
+        //
+        // if (g_origPerEntry != nullptr &&
+        //     !g_perEntryBroken.load(std::memory_order_acquire)) {
+        //     if (g_selIdxSeen.load(std::memory_order_acquire)) {
+        //         g_selectiveTries.store(0, std::memory_order_release);
+        //     } else if (g_selectiveTries.fetch_add(1, std::memory_order_relaxed) >= 2) {
+        //         g_perEntryBroken.store(true, std::memory_order_release);
+        //         REX::ERROR("ExamineLagFix: GetSelectedIndex override was never "
+        //                    "consulted across several filtered rebuilds - layer 1 "
+        //                    "disabled so the panel does not show a clamped entry");
+        //     }
+        // }
 
         if (selective) {
             g_popTargetId = a_menu->modItem.id;
@@ -980,9 +981,9 @@ namespace
         // succeeding at patching something is not enough: a build with different
         // bytes can put the patch on another function, and then the display keeps
         // using the clamped index while layer 1 still shrinks the list - which
-        // shows one fixed (alphabetically first) item for every examine. The
-        // rebuild self-check below watches this flag.
-        g_selIdxSeen.store(true, std::memory_order_release);
+        // 防御二（运行时自检）—— 当前停用，整行注释保留备查。
+        // 恢复时反注释本行 + HookedUpdateItemList 里那段自检。
+        // g_selIdxSeen.store(true, std::memory_order_release);
 
         const auto own = g_targetIndex.load(std::memory_order_acquire);
         if (own >= 0 && a_menu == g_targetMenu) {
@@ -1475,91 +1476,94 @@ namespace
         return IsInsideExe(tgt) ? tgt : 0;
     }
 
-    // Semantic cross-check for a GetSelectedIndex candidate: its body has to
-    // reference the literal "selectedIndex" (that is the SWF property it reads).
+    // ---- 防御一（语义验证）——当前停用，整段注释保留备查 ----
+    // 见 InstallGetSelIdxHook 里调用处的说明。恢复时反注释整段。
     //
-    // The string alone does NOT identify the function - roughly 25 functions in
-    // every build reference it (TerminalMenu::GetSelectedIndex,
-    // GetCurrentSlotKeyword, the ModSlotList helpers ...). It is used only to
-    // confirm or reject what the signature matched, which is what protects
-    // against a build whose bytes differ (the GOG OG report: layer 1 filtering
-    // while the override never fired, so every examine showed the alphabetically
-    // first entry instead).
+    // // Semantic cross-check for a GetSelectedIndex candidate: its body has to
+    // // reference the literal "selectedIndex" (that is the SWF property it reads).
+    // //
+    // // The string alone does NOT identify the function - roughly 25 functions in
+    // // every build reference it (TerminalMenu::GetSelectedIndex,
+    // // GetCurrentSlotKeyword, the ModSlotList helpers ...). It is used only to
+    // // confirm or reject what the signature matched, which is what protects
+    // // against a build whose bytes differ (the GOG OG report: layer 1 filtering
+    // // while the override never fired, so every examine showed the alphabetically
+    // // first entry instead).
+    // //
+    // // Only the candidate's own body is scanned (~130 bytes), not all of .text.
+    // [[nodiscard]] bool BodyReferencesSelIdxString(std::uintptr_t a_addr)
+    // {
+    //     static constexpr char kStr[]{ "selectedIndex" };
+    //     constexpr std::size_t kLen = sizeof(kStr) - 1;
     //
-    // Only the candidate's own body is scanned (~130 bytes), not all of .text.
-    [[nodiscard]] bool BodyReferencesSelIdxString(std::uintptr_t a_addr)
-    {
-        static constexpr char kStr[]{ "selectedIndex" };
-        constexpr std::size_t kLen = sizeof(kStr) - 1;
-
-        const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-        if (!base || a_addr < base) return false;
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-
-        std::uint32_t strRva[8];
-        std::size_t nStr = 0;
-        std::uintptr_t textVa = 0;
-        std::size_t textSize = 0;
-
-        auto* sec = IMAGE_FIRST_SECTION(nt);
-        bool ok = true;
-        __try {
-            for (std::uint32_t i = 0; i < nt->FileHeader.NumberOfSections && ok; ++i, ++sec) {
-                const auto sz = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
-                if (sz == 0) continue;
-                const auto* b = reinterpret_cast<const std::uint8_t*>(base + sec->VirtualAddress);
-                if (std::memcmp(sec->Name, ".text", 5) == 0) {
-                    textVa = sec->VirtualAddress;
-                    textSize = sz;
-                }
-                if ((sec->Characteristics & IMAGE_SCN_MEM_WRITE) != 0) continue;
-                // memchr for the first byte, then compare - avoids a 13-byte
-                // memcmp at every position of a multi-MB section.
-                const auto* p = b;
-                const auto* endB = b + (sz >= kLen ? sz - kLen : 0);
-                while (p <= endB && nStr < 8) {
-                    p = reinterpret_cast<const std::uint8_t*>(
-                        std::memchr(p, kStr[0], static_cast<std::size_t>(endB - p) + 1));
-                    if (!p) break;
-                    if (std::memcmp(p, kStr, kLen) == 0) {
-                        strRva[nStr++] = static_cast<std::uint32_t>(sec->VirtualAddress + (p - b));
-                    }
-                    ++p;
-                }
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            return false;
-        }
-        if (nStr == 0 || textSize == 0) return false;
-
-        std::uintptr_t begin = 0;
-        std::size_t size = 0;
-        if (!PdataBounds(a_addr, &begin, &size) || size == 0 || size > 0x1000) return false;
-
-        bool found = false;
-        __try {
-            const auto* body = reinterpret_cast<const std::uint8_t*>(begin);
-            for (std::size_t i = 0; i + 7 <= size && !found; ++i) {
-                // REX.W/S/B/D  lea  reg,[rip+rel32]   (7 bytes)
-                if (body[i] < 0x40 || body[i] > 0x4F) continue;
-                if (body[i + 1] != 0x8D) continue;
-                const auto modrm = body[i + 2];
-                if ((modrm & 0xC7) != 0x05) continue;      // mod=00 rm=101
-                const auto rel = *reinterpret_cast<const std::int32_t*>(body + i + 3);
-                const auto tgt = static_cast<std::uint32_t>(
-                    textVa + (begin - base) + i + 7 + rel);
-                for (std::size_t s = 0; s < nStr; ++s) {
-                    if (tgt == strRva[s]) { found = true; break; }
-                }
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            return false;
-        }
-        return found;
-    }
+    //     const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    //     if (!base || a_addr < base) return false;
+    //     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    //     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    //     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    //     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    //
+    //     std::uint32_t strRva[8];
+    //     std::size_t nStr = 0;
+    //     std::uintptr_t textVa = 0;
+    //     std::size_t textSize = 0;
+    //
+    //     auto* sec = IMAGE_FIRST_SECTION(nt);
+    //     bool ok = true;
+    //     __try {
+    //         for (std::uint32_t i = 0; i < nt->FileHeader.NumberOfSections && ok; ++i, ++sec) {
+    //             const auto sz = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+    //             if (sz == 0) continue;
+    //             const auto* b = reinterpret_cast<const std::uint8_t*>(base + sec->VirtualAddress);
+    //             if (std::memcmp(sec->Name, ".text", 5) == 0) {
+    //                 textVa = sec->VirtualAddress;
+    //                 textSize = sz;
+    //             }
+    //             if ((sec->Characteristics & IMAGE_SCN_MEM_WRITE) != 0) continue;
+    //             // memchr for the first byte, then compare - avoids a 13-byte
+    //             // memcmp at every position of a multi-MB section.
+    //             const auto* p = b;
+    //             const auto* endB = b + (sz >= kLen ? sz - kLen : 0);
+    //             while (p <= endB && nStr < 8) {
+    //                 p = reinterpret_cast<const std::uint8_t*>(
+    //                     std::memchr(p, kStr[0], static_cast<std::size_t>(endB - p) + 1));
+    //                 if (!p) break;
+    //                 if (std::memcmp(p, kStr, kLen) == 0) {
+    //                     strRva[nStr++] = static_cast<std::uint32_t>(sec->VirtualAddress + (p - b));
+    //                 }
+    //                 ++p;
+    //             }
+    //         }
+    //     } __except (EXCEPTION_EXECUTE_HANDLER) {
+    //         return false;
+    //     }
+    //     if (nStr == 0 || textSize == 0) return false;
+    //
+    //     std::uintptr_t begin = 0;
+    //     std::size_t size = 0;
+    //     if (!PdataBounds(a_addr, &begin, &size) || size == 0 || size > 0x1000) return false;
+    //
+    //     bool found = false;
+    //     __try {
+    //         const auto* body = reinterpret_cast<const std::uint8_t*>(begin);
+    //         for (std::size_t i = 0; i + 7 <= size && !found; ++i) {
+    //             // REX.W/S/B/D  lea  reg,[rip+rel32]   (7 bytes)
+    //             if (body[i] < 0x40 || body[i] > 0x4F) continue;
+    //             if (body[i + 1] != 0x8D) continue;
+    //             const auto modrm = body[i + 2];
+    //             if ((modrm & 0xC7) != 0x05) continue;      // mod=00 rm=101
+    //             const auto rel = *reinterpret_cast<const std::int32_t*>(body + i + 3);
+    //             const auto tgt = static_cast<std::uint32_t>(
+    //                 textVa + (begin - base) + i + 7 + rel);
+    //             for (std::size_t s = 0; s < nStr; ++s) {
+    //                 if (tgt == strRva[s]) { found = true; break; }
+    //             }
+    //         }
+    //     } __except (EXCEPTION_EXECUTE_HANDLER) {
+    //         return false;
+    //     }
+    //     return found;
+    // }
 
     bool InstallGetSelIdxHook()
     {
@@ -1590,18 +1594,20 @@ namespace
         const auto addr = ScanTextSig(kPro, sizeof(kPro), nullptr, 0, true, "GetSelIdx");
         if (!addr) return false;
 
-        // Semantic confirmation. A build whose bytes differ can make the
-        // signature land on some other function that happens to share those 13
-        // bytes; patching that would leave the display path uncorrected while
-        // layer 1 still shrinks the list - which shows the wrong item for every
-        // examine. Requiring the body to read the "selectedIndex" property
-        // rejects that.
-        if (!BodyReferencesSelIdxString(addr)) {
-            REX::ERROR("ExamineLagFix: GetSelectedIndex signature hit 0x{:X} does not "
-                       "reference the \"selectedIndex\" property - wrong function, "
-                       "hook NOT installed", addr);
-            return false;
-        }
+        // 防御一（语义验证）—— 当前停用，整段注释保留备查。
+        // 作用：签名命中的函数，其函数体必须真的引用 "selectedIndex" 字面量
+        // （用 .pdata 圈出函数范围，只扫那 ~130 字节找 rip-relative LEA 指向
+        // 字符串 RVA）。防的是"字节不同的构建上 13 字节签名命中了别的函数"。
+        // 停用理由：13 字节签名已在 OG/NG/AE 四版实测唯一命中，此校验属冗余。
+        // 若要恢复：反注释本段，并反注释 BodyReferencesSelIdxString 的定义
+        // （它在本文件 InstallGetSelIdxHook 之前）。
+        //
+        // if (!BodyReferencesSelIdxString(addr)) {
+        //     REX::ERROR("ExamineLagFix: GetSelectedIndex signature hit 0x{:X} does not "
+        //                "reference the \"selectedIndex\" property - wrong function, "
+        //                "hook NOT installed", addr);
+        //     return false;
+        // }
 
         // The 13 matched bytes are shorter than the 14-byte absolute jump, so
         // the displacement is decoded forward instead of being assumed. The
