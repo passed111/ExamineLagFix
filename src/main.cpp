@@ -257,12 +257,21 @@ namespace
             return;
         }
 
-        // It registers itself into INISettingCollection (155 PDB: the dynamic
-        // initializer calls SettingT<INISettingCollection>::InitCollection then
-        // pCollection->Add(&fInspectModeZoomDelta)), so look there first and
-        // fall back to the game setting collection.
-        auto* setting = RE::GetINISetting("fInspectModeZoomDelta");
+        // INI settings are keyed "name:section" - the real key is
+        // "fInspectModeZoomDelta:Interface" (confirmed from the log listing), so
+        // a lookup by bare name misses. Compare the part before the colon.
+        RE::Setting* setting = nullptr;
         const char* where = "INI";
+        if (auto* ini = RE::INISettingCollection::GetSingleton()) {
+            for (auto* s : ini->settings) {
+                if (!s) continue;
+                const auto key = s->GetKey();
+                const auto colon = key.find(':');
+                const auto base =
+                    (colon == std::string_view::npos) ? key : key.substr(0, colon);
+                if (base == "fInspectModeZoomDelta") { setting = s; break; }
+            }
+        }
         if (!setting) {
             if (auto* gsc = RE::GameSettingCollection::GetSingleton()) {
                 setting = gsc->GetSetting("fInspectModeZoomDelta");
@@ -299,9 +308,9 @@ namespace
             reinterpret_cast<std::byte*>(setting) + 0x08);
         const float before = *slot;
         *slot = before * a_multiplier;
-        REX::INFO("ExamineLagFix: inspect zoom speed x{} - fInspectModeZoomDelta {} -> {}",
-            static_cast<double>(a_multiplier), static_cast<double>(before),
-            static_cast<double>(*slot));
+        REX::INFO("ExamineLagFix: inspect zoom speed x{} - {} ({}): {} -> {}",
+            static_cast<double>(a_multiplier), std::string_view{ setting->GetKey() },
+            where, static_cast<double>(before), static_cast<double>(*slot));
     }
 
     std::atomic<bool>        g_selectivePop{ false };
