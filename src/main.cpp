@@ -1018,47 +1018,32 @@ namespace
             }
         }
         if (selective) {
-            const auto kept = g_popKept.load();
+            // No fallback rebuilds here on purpose.
+            //
+            // There used to be two: "nothing matched" and "targetIdx still -1".
+            // Each one ran the whole rebuild a second time, i.e. it paid the very
+            // stall this plugin exists to remove - and the second one also
+            // returned before ResolvePerEntryFromProbe() ran, so the census never
+            // got its data and layer 1 could never install. A deadlock that cost
+            // ~200ms per examine.
+            //
+            // Neither case needs rescuing. Layer 1 is only installed when the
+            // GetSelectedIndex override is live, and when it is not installed the
+            // list keeps its full length, so selectedIndex is never clamped and
+            // the display is already correct. A missed match just means the index
+            // is not published this time.
             const auto targetIdx = g_targetIndex.exchange(-1);
-            if (kept == 0) {
-                // Nothing matched modItem - the item left the inventory
-                // mid-open, or the id / stack read is wrong for this build.
-                // Rebuild unfiltered so the panel still shows something real.
-                REX::ERROR("ExamineLagFix: inspect rebuild matched nothing "
-                           "(item 0x{:08X} stack {}, {} entries) - using the "
-                           "full list instead",
-                    g_popTargetId, g_popTargetStack,
-                    g_popSkipped.load() + g_entrySkip.load());
-                g_inUpdateItemList.store(true, std::memory_order_release);
-                g_origUpdateItemList(a_menu, a_idx);
-                g_inUpdateItemList.store(false, std::memory_order_release);
-                return;
+            if (targetIdx >= 0) {
+                // Publish the examined entry's absolute index so the
+                // GetSelectedIndex hook can answer CreateModdedInventoryItem
+                // with it. The invoke re-asserts it on the SWF side as well -
+                // RefreshList may have clamped it - but the hook is what
+                // actually feeds the display.
+                g_targetIndex.store(targetIdx, std::memory_order_release);
+                g_targetMenu = a_menu;
+                Scaleform::GFx::Value args[1]{ Scaleform::GFx::Value{ targetIdx } };
+                a_menu->itemList.Invoke("selectedIndex", nullptr, args, 1);
             }
-            if (targetIdx < 0) {
-                // Entries were skipped, yet the id AND stack match never landed
-                // - so the examined entry could not be pinned down. Leaving it
-                // there would let the override keep answering with a stale index
-                // and the panel would show the wrong item, which is exactly the
-                // class of bug this filter must never introduce. Rebuild
-                // unfiltered instead: correct, slower.
-                REX::ERROR("ExamineLagFix: inspect rebuild could not pin the "
-                           "examined stack (item 0x{:08X} stack {}, kept={}) - "
-                           "using the full list instead",
-                    g_popTargetId, g_popTargetStack, kept);
-                g_inUpdateItemList.store(true, std::memory_order_release);
-                g_origUpdateItemList(a_menu, a_idx);
-                g_inUpdateItemList.store(false, std::memory_order_release);
-                return;
-            }
-            // Publish the examined entry's absolute index so the
-            // GetSelectedIndex hook can answer CreateModdedInventoryItem
-            // with it. The invoke re-asserts it on the SWF side as well -
-            // RefreshList may have clamped it - but the hook is what
-            // actually feeds the display.
-            g_targetIndex.store(targetIdx, std::memory_order_release);
-            g_targetMenu = a_menu;
-            Scaleform::GFx::Value args[1]{ Scaleform::GFx::Value{ targetIdx } };
-            a_menu->itemList.Invoke("selectedIndex", nullptr, args, 1);
         } else {
             // A non-inspect rebuild invalidates any recorded target index.
             g_targetIndex.store(-1, std::memory_order_release);
