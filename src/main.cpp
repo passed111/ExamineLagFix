@@ -1445,32 +1445,63 @@ namespace
 
     bool InstallGetSelIdxHook()
     {
-        // NG984/AE221/AE240 (offline-verified unique): push rbx; sub
-        // rsp,0x50; mov rdx,[rcx+0x498]; lea r9,[rsp+0x30] - 18 clean
-        // bytes, the rip-relative lea r8 only follows at +20. Anchors
-        // verify the body (menu+0x490/+0x488 loads) past that encoding.
+        // ExamineMenu::GetSelectedIndex - reads the SWF "selectedIndex" off
+        // ItemList and returns it as an int. Its body measures 127 bytes on 155
+        // and OG, 129 on NG and AE.
+        //
+        // 13-byte prologue, byte-verified unique (exactly one hit) and landing
+        // on the right function on ALL FOUR images checked offline:
+        //   OG 1.10.163  -> RVA 0xB1B280 (size 127)
+        //   NG 1.10.984  -> RVA 0xA0DAA0 (size 129)
+        //   AE 1.11.221  -> RVA 0xA61670 (size 129)
+        //   AE 1.11.240  -> RVA 0xA61980 (size 129)
+        //
+        //   40 53                    push rbx
+        //   48 83 EC 50              sub rsp,0x50
+        //   48 8B 91 98 04 00 00     mov rdx,[rcx+0x498]   <- ItemList
+        //
+        // The previous 18-byte signature appended `lea r9,[rsp+0x30]`. OG emits
+        // `xor eax,eax` first and the lea afterwards, so that signature matched
+        // nothing on OG - the hook silently stayed off there and layer 1 was
+        // unavailable to OG users. Dropping the trailing lea keeps the part all
+        // builds agree on.
         static constexpr std::uint8_t kPro[]{
             0x40, 0x53, 0x48, 0x83, 0xEC, 0x50,
-            0x48, 0x8B, 0x91, 0x98, 0x04, 0x00, 0x00,
-            0x4C, 0x8D, 0x4C, 0x24, 0x30 };
-        static constexpr std::uint8_t kA1[]{ 0x48, 0x89, 0x44, 0x24, 0x30, 0x89, 0x44, 0x24, 0x38 };
-        static constexpr std::uint8_t kA2[]{ 0x8B, 0x81, 0x90, 0x04, 0x00, 0x00 };
-        static constexpr std::uint8_t kA3[]{ 0x48, 0x8B, 0x89, 0x88, 0x04, 0x00, 0x00 };
-        const SigAnchor anchors[] = {
-            { 27, kA1, sizeof(kA1) },
-            { 36, kA2, sizeof(kA2) },
-            { 42, kA3, sizeof(kA3) },
-        };
-        const auto addr = ScanTextSig(kPro, sizeof(kPro), anchors, std::size(anchors),
-            true, "GetSelIdx-NG/AE");
-        if (!addr) {
-            // OG builds this function differently; nothing gets patched.
+            0x48, 0x8B, 0x91, 0x98, 0x04, 0x00, 0x00 };
+
+        const auto addr = ScanTextSig(kPro, sizeof(kPro), nullptr, 0, true, "GetSelIdx");
+        if (!addr) return false;
+
+        // The 13 matched bytes are shorter than the 14-byte absolute jump, so
+        // the displacement is decoded forward instead of being assumed. The
+        // bounds check from .pdata also rules out matching the same bytes in
+        // the middle of some other function.
+        std::uintptr_t fnBegin = 0;
+        std::size_t fnSize = 0;
+        if (PdataBounds(addr, &fnBegin, &fnSize) && fnBegin != addr) {
+            REX::ERROR("ExamineLagFix: GetSelectedIndex signature hit 0x{:X} is not a "
+                       "function entry (starts at 0x{:X}) - hook NOT installed",
+                addr, fnBegin);
             return false;
         }
-        const auto stub = PatchFuncEntry(addr, sizeof(kPro), &HookedGetSelIdx, "GetSelIdx");
+        if (fnSize != 0 && (fnSize < 100 || fnSize > 200)) {
+            REX::ERROR("ExamineLagFix: GetSelectedIndex candidate 0x{:X} has size {}, "
+                       "outside the 100-200 seen on every build - hook NOT installed",
+                addr, fnSize);
+            return false;
+        }
+        const auto hookSize = SafeHookSizeAt(addr);
+        if (hookSize == 0) {
+            REX::ERROR("ExamineLagFix: GetSelectedIndex prologue at 0x{:X} does not "
+                       "decode cleanly - hook NOT installed", addr);
+            return false;
+        }
+
+        const auto stub = PatchFuncEntry(addr, hookSize, &HookedGetSelIdx, "GetSelIdx");
         if (!stub) return false;
         g_origGetSelIdx = reinterpret_cast<GetSelIdxFn>(stub);
-        REX::INFO("ExamineLagFix: GetSelectedIndex hooked @ 0x{:X} (18 bytes)", addr);
+        REX::INFO("ExamineLagFix: GetSelectedIndex hooked @ 0x{:X} ({} bytes displaced, "
+                  "function size {})", addr, hookSize, fnSize);
         return true;
     }
 
