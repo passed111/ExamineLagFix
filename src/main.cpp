@@ -916,17 +916,31 @@ namespace
                 g_inUpdateItemList.store(false, std::memory_order_release);
                 return;
             }
-            if (targetIdx >= 0) {
-                // Publish the examined entry's absolute index so the
-                // GetSelectedIndex hook can answer CreateModdedInventoryItem
-                // with it. The invoke re-asserts it on the SWF side as well -
-                // RefreshList may have clamped it - but the hook is what
-                // actually feeds the display.
-                g_targetIndex.store(targetIdx, std::memory_order_release);
-                g_targetMenu = a_menu;
-                Scaleform::GFx::Value args[1]{ Scaleform::GFx::Value{ targetIdx } };
-                a_menu->itemList.Invoke("selectedIndex", nullptr, args, 1);
+            if (targetIdx < 0) {
+                // Entries were skipped, yet the id AND stack match never landed
+                // - so the examined entry could not be pinned down. Leaving it
+                // there would let the override keep answering with a stale index
+                // and the panel would show the wrong item, which is exactly the
+                // class of bug this filter must never introduce. Rebuild
+                // unfiltered instead: correct, slower.
+                REX::ERROR("ExamineLagFix: inspect rebuild could not pin the "
+                           "examined stack (item 0x{:08X} stack {}, kept={}) - "
+                           "using the full list instead",
+                    g_popTargetId, g_popTargetStack, kept);
+                g_inUpdateItemList.store(true, std::memory_order_release);
+                g_origUpdateItemList(a_menu, a_idx);
+                g_inUpdateItemList.store(false, std::memory_order_release);
+                return;
             }
+            // Publish the examined entry's absolute index so the
+            // GetSelectedIndex hook can answer CreateModdedInventoryItem
+            // with it. The invoke re-asserts it on the SWF side as well -
+            // RefreshList may have clamped it - but the hook is what
+            // actually feeds the display.
+            g_targetIndex.store(targetIdx, std::memory_order_release);
+            g_targetMenu = a_menu;
+            Scaleform::GFx::Value args[1]{ Scaleform::GFx::Value{ targetIdx } };
+            a_menu->itemList.Invoke("selectedIndex", nullptr, args, 1);
         } else {
             // A non-inspect rebuild invalidates any recorded target index.
             g_targetIndex.store(-1, std::memory_order_release);
@@ -1231,6 +1245,25 @@ namespace
     {
         if (g_origPerEntry != nullptr) return;
         if (g_perEntryResolved.load(std::memory_order_acquire)) return;
+
+        // HARD PRECONDITION: layer 1 may only run while the GetSelectedIndex
+        // override is live.
+        //
+        // Skipping entries shrinks the SWF list, and RefreshList then clamps
+        // its selectedIndex. The display path reads that clamped index back and
+        // indexes the native entry array with it - so without the override
+        // answering with the recorded absolute index, every examine shows
+        // whatever sits at the clamped position: one fixed item for the whole
+        // session (the 1.1.0 regression - users on OG saw .308 ammo / some note
+        // for everything). GetSelectedIndex is only patched where its signature
+        // is verified, and that does not include OG, so on OG we must stay on
+        // the populate-only filter: slower, but the display stays correct.
+        if (g_origGetSelIdx == nullptr) {
+            g_perEntryResolved.store(true, std::memory_order_release);
+            REX::INFO("ExamineLagFix: GetSelectedIndex override not available on "
+                      "this runtime - layer 1 left off, populate filter only");
+            return;
+        }
 
         g_perEntryProbe.exchange(0, std::memory_order_acq_rel);
 
