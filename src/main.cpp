@@ -257,15 +257,35 @@ namespace
             return;
         }
 
-        auto* coll = RE::INISettingCollection::GetSingleton();
-        if (!coll) {
-            REX::ERROR("ExamineLagFix: zoom speed unchanged - no INI setting collection");
-            return;
-        }
-        auto* setting = coll->GetSetting("fInspectModeZoomDelta");
+        // It registers itself into INISettingCollection (155 PDB: the dynamic
+        // initializer calls SettingT<INISettingCollection>::InitCollection then
+        // pCollection->Add(&fInspectModeZoomDelta)), so look there first and
+        // fall back to the game setting collection.
+        auto* setting = RE::GetINISetting("fInspectModeZoomDelta");
+        const char* where = "INI";
         if (!setting) {
+            if (auto* gsc = RE::GameSettingCollection::GetSingleton()) {
+                setting = gsc->GetSetting("fInspectModeZoomDelta");
+                where = "game setting";
+            }
+        }
+        if (!setting) {
+            // Not found anywhere - list whatever zoom/inspect settings do exist
+            // so the log says what the build actually has instead of just failing.
             REX::ERROR("ExamineLagFix: zoom speed unchanged - fInspectModeZoomDelta "
-                       "not found in the INI settings");
+                       "not found; zoom/inspect settings present are:");
+            if (auto* ini = RE::INISettingCollection::GetSingleton()) {
+                for (auto* s : ini->settings) {
+                    if (!s) continue;
+                    const auto key = s->GetKey();
+                    if (key.find("Zoom") == std::string_view::npos &&
+                        key.find("Inspect") == std::string_view::npos) continue;
+                    REX::ERROR("ExamineLagFix:   {} = {}", key,
+                        (s->GetType() == RE::Setting::SETTING_TYPE::kFloat)
+                            ? std::to_string(static_cast<double>(s->GetFloat()))
+                            : std::string{ "(non-float)" });
+                }
+            }
             return;
         }
         if (setting->GetType() != RE::Setting::SETTING_TYPE::kFloat) {
