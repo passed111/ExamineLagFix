@@ -191,6 +191,99 @@ namespace
         return result;
     }
 
+    // Same minimal parser, for numeric values. An unparsable value keeps the
+    // default rather than doing something surprising.
+    [[nodiscard]] float ReadTomlFloat(const char* a_key, float a_default)
+    {
+        const auto dir = PluginDir();
+        if (dir.empty()) return a_default;
+        const auto file = dir + L"ExamineLagFix.toml";
+
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, file.c_str(), L"r") != 0 || !f) return a_default;
+
+        float result = a_default;
+        char line[512]{};
+        while (std::fgets(line, sizeof(line), f)) {
+            std::string s(line);
+            const auto hash = s.find('#');
+            if (hash != std::string::npos) s = s.substr(0, hash);
+            const auto eq = s.find('=');
+            if (eq == std::string::npos) continue;
+
+            auto key = s.substr(0, eq);
+            auto val = s.substr(eq + 1);
+            const auto trim = [](std::string& t) {
+                const auto b = t.find_first_not_of(" \t\r\n");
+                if (b == std::string::npos) { t.clear(); return; }
+                const auto e = t.find_last_not_of(" \t\r\n");
+                t = t.substr(b, e - b + 1);
+            };
+            trim(key);
+            trim(val);
+            if (key != a_key) continue;
+
+            try {
+                result = std::stof(val);
+            } catch (...) {
+                result = a_default;
+            }
+            break;
+        }
+        std::fclose(f);
+        return result;
+    }
+
+    // ------------------------------------------------------------------ //
+    // Inspect-mode zoom speed
+    //
+    // One wheel notch calls BGSCodeObj.ZoomIn()/ZoomOut() once, and the engine
+    // moves the camera by
+    //     fInspectModeZoomDelta * frameDelta * multiplier
+    // every frame (ExamineMenu::AdjustZoom, 155 PDB 140b1f4e0). The step size is
+    // an INI setting rather than a constant, so speeding the zoom up needs no
+    // code patch at all - raise the setting and the engine does the rest.
+    //
+    // Setting layout (RE\S\Setting.h): [vptr](0x00) [value](0x08) [key](0x10).
+    // CommonLib exposes getters but no setter, so the float is written in place.
+    // ------------------------------------------------------------------ //
+
+    void ApplyZoomSpeed(float a_multiplier)
+    {
+        if (a_multiplier <= 0.0f) return;
+        if (a_multiplier > 100.0f) a_multiplier = 100.0f;
+        if (a_multiplier == 1.0f) {
+            REX::INFO("ExamineLagFix: inspect zoom speed x1 (vanilla)");
+            return;
+        }
+
+        auto* coll = RE::INISettingCollection::GetSingleton();
+        if (!coll) {
+            REX::ERROR("ExamineLagFix: zoom speed unchanged - no INI setting collection");
+            return;
+        }
+        auto* setting = coll->GetSetting("fInspectModeZoomDelta");
+        if (!setting) {
+            REX::ERROR("ExamineLagFix: zoom speed unchanged - fInspectModeZoomDelta "
+                       "not found in the INI settings");
+            return;
+        }
+        if (setting->GetType() != RE::Setting::SETTING_TYPE::kFloat) {
+            REX::ERROR("ExamineLagFix: zoom speed unchanged - fInspectModeZoomDelta is "
+                       "not a float setting (key \"{}\")",
+                std::string_view{ setting->GetKey() });
+            return;
+        }
+
+        auto* slot = reinterpret_cast<float*>(
+            reinterpret_cast<std::byte*>(setting) + 0x08);
+        const float before = *slot;
+        *slot = before * a_multiplier;
+        REX::INFO("ExamineLagFix: inspect zoom speed x{} - fInspectModeZoomDelta {} -> {}",
+            static_cast<double>(a_multiplier), static_cast<double>(before),
+            static_cast<double>(*slot));
+    }
+
     std::atomic<bool>        g_selectivePop{ false };
     std::uint32_t            g_popTargetId{ 0 };   // ExamineMenu::modItem.id
     // Which stack of that item is being examined. The handle id alone cannot
@@ -1707,6 +1800,7 @@ namespace
     bool InstallFixC()
     {
         g_fixInPipBoy = ReadTomlBool("InspectFixInPipBoy", true) ? 1 : 0;
+        ApplyZoomSpeed(ReadTomlFloat("ZoomSpeed", 1.0f));
         REX::INFO("ExamineLagFix: Pip-Boy inspect filter {} (ExamineLagFix.toml, "
                   "InspectFixInPipBoy)",
             g_fixInPipBoy != 0 ? "ON" : "OFF (paging works, stall returns)");

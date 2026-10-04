@@ -16,3 +16,15 @@
 # The pickup-examine panel is always filtered. It has no paging button, so there
 # is nothing to trade off there.
 InspectFixInPipBoy = true
+
+# Inspect-mode zoom speed multiplier.
+#
+# One wheel notch moves the camera by  fInspectModeZoomDelta * frameTime * this
+# value  (ExamineMenu::AdjustZoom). Raising it means fewer notches to reach the
+# same zoom.
+#
+#   1.0 = vanilla (no change)
+#   2.0 = twice as fast,   3.0 = three times as fast
+#
+# Values below 1.0 slow it down. Anything <= 0 is ignored.
+ZoomSpeed = 1.0
