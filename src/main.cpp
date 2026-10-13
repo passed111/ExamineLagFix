@@ -973,6 +973,17 @@ namespace
     void HookedUpdateItemList(RE::ExamineMenu* a_menu, std::uint64_t a_idx)
     {
         const auto t0 = NowUs();
+        // Resolve layer 1 before this rebuild wipes the census the previous one
+        // left behind. The helper is the caller that invoked populate once per
+        // native entry, and that only shows up in a full walk's tally - a resolve
+        // sitting at the end of the rebuild always landed one rebuild too late,
+        // and that rebuild ran unfiltered at full cost.
+        ResolvePerEntryFromProbe();
+        // Per-rebuild tally reset. g_popSeen is bumped by every populate call,
+        // non-inspect rebuilds included, so it has to be cleared on every pass:
+        // left inside the selective branch it keeps growing across those, and
+        // "the winning caller accounts for most calls" then never holds.
+        g_popSeen.store(0, std::memory_order_release);
         ResetPopulateCensus();
         // inspectingSingleItem is the pickup-examine panel (no paging there).
         // The Pip-Boy inspect is inspectMode without it, and that one is
@@ -1008,10 +1019,18 @@ namespace
             g_popKept.store(0);
             g_popSkipped.store(0);
             g_entrySkip.store(0);
-            g_popSeen.store(0);
             g_tFirstPop.store(0);
             g_tLastPop.store(0);
             g_targetIndexLocked.store(false, std::memory_order_release);
+            // Per-rebuild reset of the published index. It is a global shared
+            // by every examine, and the exchange below reads it straight back:
+            // a value left over from the previous examine gets published again
+            // whenever this rebuild pins nothing down - that is the "shows the
+            // item from the previous examine" report. Starting at -1 means a
+            // missed match publishes nothing instead, so a stale item can
+            // never reach the panel.
+            g_targetIndex.store(-1, std::memory_order_release);
+            g_targetMenu = nullptr;
             g_selectivePop.store(true, std::memory_order_release);
         }
         g_inUpdateItemList.store(true, std::memory_order_release);
@@ -1047,22 +1066,16 @@ namespace
             }
         }
         if (selective) {
-            // No fallback rebuilds here on purpose.
-            //
-            // There used to be two: "nothing matched" and "targetIdx still -1".
-            // Each one ran the whole rebuild a second time, i.e. it paid the very
-            // stall this plugin exists to remove - and the second one also
-            // returned before ResolvePerEntryFromProbe() ran, so the census never
-            // got its data and layer 1 could never install. A deadlock that cost
-            // ~200ms per examine.
-            //
-            // Neither case needs rescuing. Layer 1 is only installed when the
-            // GetSelectedIndex override is live, and when it is not installed the
-            // list keeps its full length, so selectedIndex is never clamped and
-            // the display is already correct. A missed match just means the index
-            // is not published this time.
             const auto targetIdx = g_targetIndex.exchange(-1);
-            if (targetIdx >= 0) {
+            if (targetIdx < 0) {
+                // No entry in this walk stood for the examined stack, so there
+                // is no absolute index to hand the display path. Leave it
+                // unpublished - the override then answers from the SWF side.
+                REX::ERROR("ExamineLagFix: inspect rebuild could not pin the "
+                           "examined stack (item 0x{:08X} stack {}, kept={}) - "
+                           "index left unpublished",
+                    g_popTargetId, g_popTargetStack, g_popKept.load());
+            } else {
                 // Publish the examined entry's absolute index so the
                 // GetSelectedIndex hook can answer CreateModdedInventoryItem
                 // with it. The invoke re-asserts it on the SWF side as well -
@@ -1077,9 +1090,6 @@ namespace
             // A non-inspect rebuild invalidates any recorded target index.
             g_targetIndex.store(-1, std::memory_order_release);
         }
-        // Locate the per-entry helper from the rebuild we just ran, so the
-        // next one is filtered. See ResolvePerEntryFromProbe.
-        ResolvePerEntryFromProbe();
     }
 
     std::int64_t HookedGetSelIdx(RE::ExamineMenu* a_menu)
@@ -1196,20 +1206,26 @@ namespace
                 return 1;  // vanilla always returns 1; 0 would abort the walk
             }
 
-            if (stackHit) {
-                __try {
-                    auto* counter = *reinterpret_cast<std::int32_t**>(
-                        static_cast<std::byte*>(a_ctx) + 0x10);
-                    if (PlausibleCounter(counter)) {
-                        bool expected = false;
-                        if (g_targetIndexLocked.compare_exchange_strong(expected, true,
-                                std::memory_order_acq_rel)) {
-                            g_targetIndex.store(*counter, std::memory_order_release);
-                        }
+            // Record the absolute index of the entry standing for the examined
+            // stack. The exact stack wins; where the stack probe cannot confirm
+            // it - EntryHasStack reads engine memory under SEH and just returns
+            // false on a bad read - fall back to the first entry carrying the
+            // handle id. With kept == 1 that entry IS the examined one, so the
+            // panel lands on the right item instead of a stale index.
+            __try {
+                auto* counter = *reinterpret_cast<std::int32_t**>(
+                    static_cast<std::byte*>(a_ctx) + 0x10);
+                if (PlausibleCounter(counter)) {
+                    if (stackHit) {
+                        g_targetIndex.store(*counter, std::memory_order_release);
+                        g_targetIndexLocked.store(true, std::memory_order_release);
+                    } else if (!g_targetIndexLocked.load(std::memory_order_acquire) &&
+                               g_targetIndex.load(std::memory_order_acquire) < 0) {
+                        g_targetIndex.store(*counter, std::memory_order_release);
                     }
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    g_perEntryBroken.store(true, std::memory_order_release);
                 }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                g_perEntryBroken.store(true, std::memory_order_release);
             }
             return g_origPerEntry(a_ctx, a_entry);
         }
@@ -1814,10 +1830,10 @@ namespace
     bool InstallFixC()
     {
         g_fixInPipBoy = ReadTomlBool("InspectFixInPipBoy", true) ? 1 : 0;
-        ApplyZoomSpeed(ReadTomlFloat("ZoomSpeed", 1.0f));
         REX::INFO("ExamineLagFix: Pip-Boy inspect filter {} (ExamineLagFix.toml, "
                   "InspectFixInPipBoy)",
             g_fixInPipBoy != 0 ? "ON" : "OFF (paging works, stall returns)");
+        ApplyZoomSpeed(ReadTomlFloat("ZoomSpeed", 1.0f));
         // No address-library ID exists for UpdateItemList or the populate
         // thunk; the slot layout itself is the identification (0x20 proved
         // identical on all three runtimes, and the 0x2F/0x38 entries land
@@ -1897,7 +1913,10 @@ namespace
         // Walk timing: first to last populate call is the span the entry loop
         // actually spends visiting entries.
         const auto now = NowUs();
-        g_popSeen.fetch_add(1, std::memory_order_relaxed);
+        // The walk visits the native entry array in order and reaches populate
+        // once per entry, so this count is the entry's absolute index - but only
+        // while layer 1 is not skipping entries ahead of us.
+        const auto walkIdx = g_popSeen.fetch_add(1, std::memory_order_relaxed);
         if (g_tFirstPop.load(std::memory_order_relaxed) == 0) {
             g_tFirstPop.store(now, std::memory_order_release);
         }
@@ -1916,6 +1935,20 @@ namespace
                 return;
             }
             g_popKept.fetch_add(1);
+            // Layer 1 is not installed, so nothing recorded the absolute index
+            // during the walk - record it here instead. Exact stack wins; failing
+            // that, the first entry carrying the handle id is used, which for a
+            // single-stack item is the examined entry itself.
+            if (g_origPerEntry == nullptr) {
+                const auto idx = static_cast<std::int32_t>(walkIdx);
+                if (a_entry && EntryHasStack(a_entry, g_popTargetStack)) {
+                    g_targetIndex.store(idx, std::memory_order_release);
+                    g_targetIndexLocked.store(true, std::memory_order_release);
+                } else if (!g_targetIndexLocked.load(std::memory_order_acquire) &&
+                               g_targetIndex.load(std::memory_order_acquire) < 0) {
+                    g_targetIndex.store(idx, std::memory_order_release);
+                }
+            }
         }
         g_origPopulate(a_menu, a_owner, a_entry, a_itemObj);
     }
